@@ -2,6 +2,12 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'app_theme.dart';
+import 'history_screen.dart';
+import 'session.dart';
+import 'track_screen.dart';
+import 'treadmill_data.dart';
 
 const String kFtmsServiceUuid = '1826';
 const String kTreadmillDataUuid = '2acd';
@@ -13,6 +19,25 @@ const double kSpeedMax = 6.0;
 const double kSpeedStep = 0.1;
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  FlutterForegroundTask.initCommunicationPort();
+  FlutterForegroundTask.init(
+    androidNotificationOptions: AndroidNotificationOptions(
+      channelId: 'kscan_service',
+      channelName: 'KSCAN — Caminadora',
+      channelImportance: NotificationChannelImportance.LOW,
+      priority: NotificationPriority.LOW,
+    ),
+    iosNotificationOptions: const IOSNotificationOptions(
+      showNotification: false,
+    ),
+    foregroundTaskOptions: ForegroundTaskOptions(
+      eventAction: ForegroundTaskEventAction.nothing(),
+      autoRunOnBoot: false,
+      allowWakeLock: true,
+      allowWifiLock: true,
+    ),
+  );
   runApp(const KScanApp());
 }
 
@@ -24,10 +49,7 @@ class KScanApp extends StatelessWidget {
     return MaterialApp(
       title: 'KSCAN',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
-        useMaterial3: true,
-      ),
+      theme: KScanTheme.theme,
       home: const TreadmillScreen(),
     );
   }
@@ -38,47 +60,6 @@ class KScanApp extends StatelessWidget {
 // ---------------------------------------------------------------------------
 
 enum TreadmillState { idle, running, paused }
-
-// ---------------------------------------------------------------------------
-// Modelo de datos
-// ---------------------------------------------------------------------------
-
-class TreadmillData {
-  final double speedKmh;
-  final int distanceMeters;
-  final int totalEnergyKcal;
-  final int elapsedSeconds;
-  final int steps;
-
-  const TreadmillData({
-    required this.speedKmh,
-    required this.distanceMeters,
-    required this.totalEnergyKcal,
-    required this.elapsedSeconds,
-    required this.steps,
-  });
-
-  // Paquete FTMS 0x2ACD (17 bytes):
-  // [0-1] flags  [2-3] speed×0.01km/h  [4-6] distance m
-  // [7-8] kcal   [9-10] kcal/h  [11] kcal/min
-  // [12-13] elapsed s  [14] steps (propietario KingSmith)  [15-16] 0x0000
-  static TreadmillData? fromBytes(List<int> bytes) {
-    if (bytes.length < 15) return null;
-    return TreadmillData(
-      speedKmh: (bytes[2] | (bytes[3] << 8)) * 0.01,
-      distanceMeters: bytes[4] | (bytes[5] << 8) | (bytes[6] << 16),
-      totalEnergyKcal: bytes[7] | (bytes[8] << 8),
-      elapsedSeconds: bytes[12] | (bytes[13] << 8),
-      steps: bytes[14],
-    );
-  }
-
-  String get elapsedFormatted {
-    final m = elapsedSeconds ~/ 60;
-    final s = elapsedSeconds % 60;
-    return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Pantalla principal
@@ -96,6 +77,9 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
   List<BluetoothService> _services = [];
   BluetoothCharacteristic? _controlPoint;
   StreamSubscription<List<int>>? _dataSubscription;
+  StreamSubscription<BluetoothConnectionState>? _connectionStateSub;
+  bool _disconnecting = false;
+  int _reconnectAttempts = 0;
 
   TreadmillData? _data;
   TreadmillState _treadmillState = TreadmillState.idle;
@@ -105,8 +89,27 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
   bool _scanning = false;
   bool _connected = false;
 
+  // Live data notifier (para TrackScreen)
+  final _dataNotifier = ValueNotifier<TreadmillData?>(null);
+
+  // Session tracking
+  SessionRepository? _repo;
+  DateTime? _sessionStart;
+  List<WorkoutSession> _todaySessions = [];
+
+  @override
+  void initState() {
+    super.initState();
+    SessionRepository.create().then((repo) {
+      _repo = repo;
+      setState(() => _todaySessions = repo.loadToday());
+    });
+  }
+
   @override
   void dispose() {
+    _dataNotifier.dispose();
+    _connectionStateSub?.cancel();
     _dataSubscription?.cancel();
     _device?.disconnect();
     super.dispose();
@@ -134,6 +137,13 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
         _status = 'Descubriendo servicios...';
       });
 
+      _connectionStateSub?.cancel();
+      _connectionStateSub = device.connectionState.listen((state) {
+        if (state == BluetoothConnectionState.disconnected && _connected && !_disconnecting) {
+          _handleUnexpectedDisconnect();
+        }
+      });
+
       final services = await device.discoverServices();
       setState(() => _services = services);
 
@@ -146,7 +156,11 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
               await char.setNotifyValue(true);
               _dataSubscription = char.lastValueStream.listen((bytes) {
                 final parsed = TreadmillData.fromBytes(bytes);
-                if (parsed != null && mounted) setState(() => _data = parsed);
+                if (parsed != null && mounted) {
+                  setState(() => _data = parsed);
+                  _dataNotifier.value = parsed;
+                  _updateForegroundNotification();
+                }
               });
             }
 
@@ -171,6 +185,7 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
           _scanning = false;
           _status = 'Conectado';
         });
+        await _startForegroundService();
       } else {
         setState(() => _status = 'Control Point no encontrado');
       }
@@ -183,8 +198,15 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
   }
 
   Future<void> _disconnect() async {
+    _disconnecting = true;
+    await _savePartialSession();
+    await _stopForegroundService();
+    await _connectionStateSub?.cancel();
     await _dataSubscription?.cancel();
     await _device?.disconnect();
+    _disconnecting = false;
+    _reconnectAttempts = 0;
+    _dataNotifier.value = null;
     setState(() {
       _device = null;
       _services = [];
@@ -192,8 +214,66 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
       _connected = false;
       _data = null;
       _treadmillState = TreadmillState.idle;
+      _sessionStart = null;
       _status = 'Desconectado';
     });
+  }
+
+  Future<void> _savePartialSession() async {
+    if (_sessionStart == null || _data == null || _repo == null) return;
+    if (_data!.elapsedSeconds == 0) return;
+    final session = WorkoutSession(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      startedAt: _sessionStart!,
+      endedAt: DateTime.now(),
+      distanceMeters: _data!.distanceMeters,
+      calories: _data!.totalEnergyKcal,
+      durationSeconds: _data!.elapsedSeconds,
+    );
+    await _repo!.save(session);
+    _sessionStart = null;
+    if (mounted) setState(() => _todaySessions = _repo!.loadToday());
+  }
+
+  Future<void> _handleUnexpectedDisconnect() async {
+    await _savePartialSession();
+    await _connectionStateSub?.cancel();
+    await _dataSubscription?.cancel();
+    if (!mounted) return;
+    _dataNotifier.value = null;
+    setState(() {
+      _connected = false;
+      _controlPoint = null;
+      _data = null;
+      _treadmillState = TreadmillState.idle;
+      _status = 'Conexión perdida. Reconectando...';
+    });
+    FlutterForegroundTask.updateService(
+      notificationTitle: 'KSCAN — Reconectando...',
+      notificationText: 'Buscando K3',
+    );
+    await _retryConnect();
+  }
+
+  Future<void> _retryConnect() async {
+    const maxAttempts = 5;
+    while (_reconnectAttempts < maxAttempts && !_disconnecting && mounted) {
+      _reconnectAttempts++;
+      if (mounted) {
+        setState(() => _status = 'Reconectando... (intento $_reconnectAttempts/$maxAttempts)');
+      }
+      await Future.delayed(const Duration(seconds: 3));
+      if (_disconnecting || !mounted) return;
+      await _connect(BluetoothDevice.fromId(kDeviceMac));
+      if (_connected) {
+        _reconnectAttempts = 0;
+        return;
+      }
+    }
+    if (mounted && !_connected) {
+      setState(() => _status = 'No se pudo reconectar. Presioná Conectar.');
+      await _stopForegroundService();
+    }
   }
 
   // ---- Treadmill control ----
@@ -213,6 +293,9 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
   }
 
   Future<void> _start() async {
+    if (_treadmillState == TreadmillState.idle) {
+      _sessionStart = DateTime.now();
+    }
     await _sendCommand([0x07]);
     setState(() => _treadmillState = TreadmillState.running);
   }
@@ -224,6 +307,7 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
 
   Future<void> _stop() async {
     await _sendCommand([0x08, 0x01]);
+    await _savePartialSession();
     setState(() {
       _treadmillState = TreadmillState.idle;
       _targetSpeed = kSpeedMin;
@@ -248,6 +332,36 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
     _setSpeed(rounded);
   }
 
+  // ---- Foreground service ----
+
+  Future<void> _startForegroundService() async {
+    await FlutterForegroundTask.requestNotificationPermission();
+    if (await FlutterForegroundTask.isRunningService) return;
+    await FlutterForegroundTask.startService(
+      serviceId: 1000,
+      notificationTitle: 'KSCAN — Conectado',
+      notificationText: 'K3 conectada y monitoreando',
+    );
+  }
+
+  Future<void> _updateForegroundNotification() async {
+    if (!(await FlutterForegroundTask.isRunningService) || _data == null) return;
+    final d = _data!;
+    final running = _treadmillState == TreadmillState.running;
+    FlutterForegroundTask.updateService(
+      notificationTitle: running ? 'KSCAN — Sesión activa' : 'KSCAN — K3 conectada',
+      notificationText: running
+          ? '${d.speedKmh.toStringAsFixed(1)} km/h · ${d.distanceMeters} m · ${d.elapsedFormatted}'
+          : '${d.distanceMeters} m recorridos hoy',
+    );
+  }
+
+  Future<void> _stopForegroundService() async {
+    if (await FlutterForegroundTask.isRunningService) {
+      await FlutterForegroundTask.stopService();
+    }
+  }
+
   // ---- Navigation ----
 
   void _openDiagnostics() {
@@ -265,11 +379,30 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('KSCAN — KingSmith K3'),
-        centerTitle: true,
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        title: const Text('KSCAN'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.history),
+            tooltip: 'Historial',
+            onPressed: () async {
+              await Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => HistoryScreen(repo: _repo)),
+              );
+              if (mounted) setState(() => _todaySessions = _repo?.loadToday() ?? []);
+            },
+          ),
           if (_connected) ...[
+            IconButton(
+              icon: const Icon(Icons.route),
+              tooltip: 'Pista 400m',
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => TrackScreen(dataNotifier: _dataNotifier),
+                ),
+              ),
+            ),
             IconButton(
               icon: const Icon(Icons.bug_report),
               tooltip: 'Diagnóstico BLE',
@@ -284,15 +417,21 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
         ],
       ),
       body: Padding(
-        padding: const EdgeInsets.all(24),
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             // Estado de conexión
             _StatusBar(connected: _connected, status: _status),
-            const SizedBox(height: 24),
+            const SizedBox(height: 12),
 
-            // Métricas
+            // Resumen del día
+            if (_todaySessions.isNotEmpty) ...[
+              _DayCard(sessions: _todaySessions),
+              const SizedBox(height: 8),
+            ],
+
+            // Métricas de la sesión actual
             if (_data != null) ...[
               _DataCard(label: 'Velocidad', value: '${_data!.speedKmh.toStringAsFixed(2)} km/h', icon: Icons.speed),
               _DataCard(label: 'Distancia', value: '${_data!.distanceMeters} m', icon: Icons.straighten),
@@ -314,23 +453,26 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
             if (_connected) ...[
               SafeArea(
                 top: false,
-                child: Column(
-                  children: [
-                    _SpeedControl(
-                      targetSpeed: _targetSpeed,
-                      enabled: _treadmillState == TreadmillState.running,
-                      onIncrease: _increaseSpeed,
-                      onDecrease: _decreaseSpeed,
-                    ),
-                    const SizedBox(height: 16),
-                    _ControlButtons(
-                      state: _treadmillState,
-                      onStart: _start,
-                      onPause: _pause,
-                      onResume: _start,
-                      onStop: _stop,
-                    ),
-                  ],
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Column(
+                    children: [
+                      _SpeedControl(
+                        targetSpeed: _targetSpeed,
+                        enabled: _treadmillState == TreadmillState.running,
+                        onIncrease: _increaseSpeed,
+                        onDecrease: _decreaseSpeed,
+                      ),
+                      const SizedBox(height: 10),
+                      _ControlButtons(
+                        state: _treadmillState,
+                        onStart: _start,
+                        onPause: _pause,
+                        onResume: _start,
+                        onStop: _stop,
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ],
@@ -367,27 +509,41 @@ class _StatusBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 18),
       decoration: BoxDecoration(
-        color: connected ? Colors.green.shade50 : Colors.grey.shade100,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: connected ? Colors.green : Colors.grey.shade300),
+        color: connected ? KScanColors.surfaceDark : KScanColors.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: connected ? KScanColors.surfaceDark : KScanColors.divider,
+        ),
       ),
       child: Row(
         children: [
           Icon(
             connected ? Icons.bluetooth_connected : Icons.bluetooth,
-            color: connected ? Colors.green : Colors.grey,
+            color: connected ? KScanColors.accent : KScanColors.muted,
+            size: 20,
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 10),
           Expanded(
             child: Text(
               status,
               style: TextStyle(
-                color: connected ? Colors.green.shade800 : Colors.grey.shade700,
+                color: connected ? KScanColors.background : KScanColors.muted,
+                fontWeight: connected ? FontWeight.w500 : FontWeight.normal,
+                fontSize: 14,
               ),
             ),
           ),
+          if (connected)
+            Container(
+              width: 8,
+              height: 8,
+              decoration: const BoxDecoration(
+                color: KScanColors.accent,
+                shape: BoxShape.circle,
+              ),
+            ),
         ],
       ),
     );
@@ -409,43 +565,73 @@ class _SpeedControl extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color = Theme.of(context).colorScheme.primary;
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+      padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
       decoration: BoxDecoration(
-        border: Border.all(color: Colors.grey.shade300),
-        borderRadius: BorderRadius.circular(12),
+        color: KScanColors.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: KScanColors.divider),
       ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          IconButton.filled(
+          _SpeedButton(
+            icon: Icons.remove,
             onPressed: enabled && targetSpeed > kSpeedMin ? onDecrease : null,
-            icon: const Icon(Icons.remove),
-            iconSize: 28,
           ),
           Column(
             children: [
               Text(
                 '${targetSpeed.toStringAsFixed(1)} km/h',
                 style: TextStyle(
-                  fontSize: 28,
-                  fontWeight: FontWeight.bold,
-                  color: enabled ? color : Colors.grey,
+                  fontSize: 30,
+                  fontWeight: FontWeight.w700,
+                  color: enabled ? KScanColors.ink : KScanColors.muted,
+                  letterSpacing: -0.5,
                 ),
               ),
               Text(
                 'velocidad objetivo',
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: KScanColors.muted,
+                ),
               ),
             ],
           ),
-          IconButton.filled(
+          _SpeedButton(
+            icon: Icons.add,
             onPressed: enabled && targetSpeed < kSpeedMax ? onIncrease : null,
-            icon: const Icon(Icons.add),
-            iconSize: 28,
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _SpeedButton extends StatelessWidget {
+  final IconData icon;
+  final VoidCallback? onPressed;
+
+  const _SpeedButton({required this.icon, required this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    final active = onPressed != null;
+    return GestureDetector(
+      onTap: onPressed,
+      child: Container(
+        width: 48,
+        height: 48,
+        decoration: BoxDecoration(
+          color: active ? KScanColors.ink : KScanColors.divider,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Icon(
+          icon,
+          color: active ? KScanColors.surface : KScanColors.muted,
+          size: 22,
+        ),
       ),
     );
   }
@@ -473,10 +659,7 @@ class _ControlButtons extends StatelessWidget {
           onPressed: onStart,
           icon: const Icon(Icons.play_arrow),
           label: const Text('Iniciar'),
-          style: FilledButton.styleFrom(
-            minimumSize: const Size.fromHeight(52),
-            backgroundColor: Colors.green,
-          ),
+          // Hereda el estilo golden del tema
         ),
       TreadmillState.running => Row(
           children: [
@@ -487,7 +670,11 @@ class _ControlButtons extends StatelessWidget {
                 label: const Text('Pausar'),
                 style: FilledButton.styleFrom(
                   minimumSize: const Size.fromHeight(52),
-                  backgroundColor: Colors.orange,
+                  backgroundColor: KScanColors.surfaceDark,
+                  foregroundColor: KScanColors.surface,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
                 ),
               ),
             ),
@@ -500,21 +687,24 @@ class _ControlButtons extends StatelessWidget {
                 onPressed: onResume,
                 icon: const Icon(Icons.play_arrow),
                 label: const Text('Reanudar'),
-                style: FilledButton.styleFrom(
-                  minimumSize: const Size.fromHeight(52),
-                  backgroundColor: Colors.green,
-                ),
+                // Hereda el estilo golden del tema
               ),
             ),
             const SizedBox(width: 12),
             Expanded(
-              child: FilledButton.icon(
+              child: OutlinedButton.icon(
                 onPressed: onStop,
-                icon: const Icon(Icons.stop),
-                label: const Text('Detener'),
-                style: FilledButton.styleFrom(
+                icon: const Icon(Icons.stop, color: KScanColors.stateStop),
+                label: const Text(
+                  'Detener',
+                  style: TextStyle(color: KScanColors.stateStop),
+                ),
+                style: OutlinedButton.styleFrom(
                   minimumSize: const Size.fromHeight(52),
-                  backgroundColor: Colors.red,
+                  side: const BorderSide(color: KScanColors.stateStop),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
                 ),
               ),
             ),
@@ -538,25 +728,139 @@ class _DataCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Card(
-      margin: const EdgeInsets.only(bottom: 10),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
         child: Row(
           children: [
-            Icon(icon, color: Theme.of(context).colorScheme.primary),
-            const SizedBox(width: 12),
-            Text(label, style: Theme.of(context).textTheme.titleMedium),
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: KScanColors.accentLight,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Icon(icon, color: KScanColors.accent, size: 20),
+            ),
+            const SizedBox(width: 14),
+            Text(
+              label,
+              style: const TextStyle(
+                fontSize: 14,
+                color: KScanColors.muted,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
             const Spacer(),
             Text(
               value,
-              style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                    fontWeight: FontWeight.bold,
-                    color: Theme.of(context).colorScheme.primary,
-                  ),
+              style: const TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w700,
+                color: KScanColors.ink,
+                letterSpacing: -0.3,
+              ),
             ),
           ],
         ),
       ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Card resumen del día
+// ---------------------------------------------------------------------------
+
+class _DayCard extends StatelessWidget {
+  final List<WorkoutSession> sessions;
+
+  const _DayCard({required this.sessions});
+
+  @override
+  Widget build(BuildContext context) {
+    final totalDistance = sessions.fold(0, (sum, s) => sum + s.distanceMeters);
+    final totalCalories = sessions.fold(0, (sum, s) => sum + s.calories);
+    final totalSeconds = sessions.fold(0, (sum, s) => sum + s.durationSeconds);
+    final totalMin = totalSeconds ~/ 60;
+    final totalSec = totalSeconds % 60;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 18),
+      decoration: BoxDecoration(
+        color: KScanColors.surfaceDark,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.today, size: 14, color: KScanColors.accent),
+              const SizedBox(width: 6),
+              Text(
+                'Hoy · ${sessions.length} sesión${sessions.length > 1 ? 'es' : ''}',
+                style: const TextStyle(
+                  color: KScanColors.accent,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 13,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceAround,
+            children: [
+              _DayStat(
+                icon: Icons.straighten,
+                value: '$totalDistance m',
+                label: 'distancia',
+              ),
+              _DayStat(
+                icon: Icons.timer,
+                value:
+                    '${totalMin.toString().padLeft(2, '0')}:${totalSec.toString().padLeft(2, '0')}',
+                label: 'tiempo',
+              ),
+              _DayStat(
+                icon: Icons.local_fire_department,
+                value: '$totalCalories kcal',
+                label: 'calorías',
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DayStat extends StatelessWidget {
+  final IconData icon;
+  final String value;
+  final String label;
+
+  const _DayStat({required this.icon, required this.value, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Icon(icon, size: 16, color: KScanColors.accent),
+        const SizedBox(height: 4),
+        Text(
+          value,
+          style: const TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.w700,
+            color: KScanColors.background,
+          ),
+        ),
+        Text(
+          label,
+          style: const TextStyle(fontSize: 11, color: KScanColors.muted),
+        ),
+      ],
     );
   }
 }
@@ -677,7 +981,6 @@ class _DiagnosticScreenState extends State<DiagnosticScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Diagnóstico BLE'),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
       ),
       body: ListView(
         padding: const EdgeInsets.all(16),
