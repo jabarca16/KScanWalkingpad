@@ -6,6 +6,7 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'app_theme.dart';
 import 'history_screen.dart';
 import 'session.dart';
+import 'speed_chart_card.dart';
 import 'track_screen.dart';
 import 'treadmill_data.dart';
 
@@ -97,6 +98,20 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
   DateTime? _sessionStart;
   List<WorkoutSession> _todaySessions = [];
 
+  // Telemetría — muestras de velocidad cada 5s
+  final List<SpeedSample> _sessionSamples = [];
+  Timer? _sampleTimer;
+  int _sampleElapsed = 0;
+
+  // Baseline al inicio de cada sesión (la K3 acumula contadores por conexión)
+  int _baselineDistance = 0;
+  int _baselineSeconds = 0;
+  int _baselineCalories = 0;
+  int _baselineSteps = 0;
+
+  // PageView controller
+  final _pageController = PageController();
+
   @override
   void initState() {
     super.initState();
@@ -108,6 +123,8 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
 
   @override
   void dispose() {
+    _sampleTimer?.cancel();
+    _pageController.dispose();
     _dataNotifier.dispose();
     _connectionStateSub?.cancel();
     _dataSubscription?.cancel();
@@ -221,14 +238,15 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
 
   Future<void> _savePartialSession() async {
     if (_sessionStart == null || _data == null || _repo == null) return;
-    if (_data!.elapsedSeconds == 0) return;
+    if (_sessionSeconds == 0) return;
     final session = WorkoutSession(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       startedAt: _sessionStart!,
       endedAt: DateTime.now(),
-      distanceMeters: _data!.distanceMeters,
-      calories: _data!.totalEnergyKcal,
-      durationSeconds: _data!.elapsedSeconds,
+      distanceMeters: _sessionDistance,
+      calories: _sessionCalories,
+      durationSeconds: _sessionSeconds,
+      samples: List.unmodifiable(_sessionSamples),
     );
     await _repo!.save(session);
     _sessionStart = null;
@@ -295,22 +313,56 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
   Future<void> _start() async {
     if (_treadmillState == TreadmillState.idle) {
       _sessionStart = DateTime.now();
+      _sessionSamples.clear();
+      _sampleElapsed = 0;
+      _baselineDistance = _data?.distanceMeters ?? 0;
+      _baselineSeconds  = _data?.elapsedSeconds  ?? 0;
+      _baselineCalories = _data?.totalEnergyKcal ?? 0;
+      _baselineSteps    = _data?.steps           ?? 0;
     }
     await _sendCommand([0x07]);
     setState(() => _treadmillState = TreadmillState.running);
+    _startSampleTimer();
   }
 
   Future<void> _pause() async {
     await _sendCommand([0x08, 0x02]);
+    _sampleTimer?.cancel();
     setState(() => _treadmillState = TreadmillState.paused);
   }
 
   Future<void> _stop() async {
     await _sendCommand([0x08, 0x01]);
+    _sampleTimer?.cancel();
     await _savePartialSession();
     setState(() {
       _treadmillState = TreadmillState.idle;
       _targetSpeed = kSpeedMin;
+      _sessionSamples.clear();
+      _sampleElapsed = 0;
+    });
+  }
+
+  // Valores de la sesión actual (delta respecto a la baseline)
+  int get _sessionDistance => (_data?.distanceMeters ?? 0) - _baselineDistance;
+  int get _sessionSeconds  => (_data?.elapsedSeconds  ?? 0) - _baselineSeconds;
+  int get _sessionCalories => (_data?.totalEnergyKcal ?? 0) - _baselineCalories;
+  int get _sessionSteps    => (_data?.steps           ?? 0) - _baselineSteps;
+
+  String _fmtSeconds(int s) {
+    final m = s ~/ 60;
+    final sec = s % 60;
+    return '${m.toString().padLeft(2, '0')}:${sec.toString().padLeft(2, '0')}';
+  }
+
+  void _startSampleTimer() {
+    _sampleTimer?.cancel();
+    _sampleTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (_data == null) return;
+      _sampleElapsed += 5;
+      setState(() {
+        _sessionSamples.add(SpeedSample(t: _sampleElapsed, v: _data!.speedKmh));
+      });
     });
   }
 
@@ -351,8 +403,8 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
     FlutterForegroundTask.updateService(
       notificationTitle: running ? 'KSCAN — Sesión activa' : 'KSCAN — K3 conectada',
       notificationText: running
-          ? '${d.speedKmh.toStringAsFixed(1)} km/h · ${d.distanceMeters} m · ${d.elapsedFormatted}'
-          : '${d.distanceMeters} m recorridos hoy',
+          ? '${d.speedKmh.toStringAsFixed(1)} km/h · ${_sessionDistance} m · ${_fmtSeconds(_sessionSeconds)}'
+          : '$_sessionDistance m en esta sesión',
     );
   }
 
@@ -399,7 +451,13 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
               onPressed: () => Navigator.push(
                 context,
                 MaterialPageRoute(
-                  builder: (_) => TrackScreen(dataNotifier: _dataNotifier),
+                  builder: (_) => TrackScreen(
+                    dataNotifier: _dataNotifier,
+                    baselineDistance: _baselineDistance,
+                    baselineSeconds: _baselineSeconds,
+                    baselineCalories: _baselineCalories,
+                    baselineSteps: _baselineSteps,
+                  ),
                 ),
               ),
             ),
@@ -431,23 +489,39 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
               const SizedBox(height: 8),
             ],
 
-            // Métricas de la sesión actual
-            if (_data != null) ...[
-              _DataCard(label: 'Velocidad', value: '${_data!.speedKmh.toStringAsFixed(2)} km/h', icon: Icons.speed),
-              _DataCard(label: 'Distancia', value: '${_data!.distanceMeters} m', icon: Icons.straighten),
-              _DataCard(label: 'Tiempo', value: _data!.elapsedFormatted, icon: Icons.timer),
-              _DataCard(label: 'Calorías', value: '${_data!.totalEnergyKcal} kcal', icon: Icons.local_fire_department),
-              _DataCard(label: 'Pasos', value: '${_data!.steps}', icon: Icons.directions_walk),
-            ] else if (_connected) ...[
-              const Center(
-                child: Padding(
-                  padding: EdgeInsets.all(16),
-                  child: Text('Esperando datos...', textAlign: TextAlign.center),
+            // Telemetría — PageView swipeable
+            if (_connected) ...[
+              Expanded(
+                child: Column(
+                  children: [
+                    Expanded(
+                      child: PageView(
+                        controller: _pageController,
+                        children: [
+                          SpeedChartCard(
+                            samples: _sessionSamples,
+                            currentSpeed: _data?.speedKmh,
+                            elapsedSeconds: _data != null ? _sessionSeconds : null,
+                            distanceMeters: _data != null ? _sessionDistance : null,
+                            calories: _data != null ? _sessionCalories : null,
+                            steps: _data != null ? _sessionSteps : null,
+                          ),
+                          // Próximas páginas irán aquí
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    _PageIndicator(
+                      controller: _pageController,
+                      count: 1,
+                    ),
+                  ],
                 ),
               ),
+              const SizedBox(height: 10),
+            ] else ...[
+              const Spacer(),
             ],
-
-            const Spacer(),
 
             // Panel de control (solo cuando conectado)
             if (_connected) ...[
@@ -462,6 +536,7 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
                         enabled: _treadmillState == TreadmillState.running,
                         onIncrease: _increaseSpeed,
                         onDecrease: _decreaseSpeed,
+                        onSpeedSet: _setSpeed,
                       ),
                       const SizedBox(height: 10),
                       _ControlButtons(
@@ -555,13 +630,28 @@ class _SpeedControl extends StatelessWidget {
   final bool enabled;
   final VoidCallback onIncrease;
   final VoidCallback onDecrease;
+  final ValueChanged<double> onSpeedSet;
 
   const _SpeedControl({
     required this.targetSpeed,
     required this.enabled,
     required this.onIncrease,
     required this.onDecrease,
+    required this.onSpeedSet,
   });
+
+  void _openSlider(BuildContext context) {
+    if (!enabled) return;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (_) => _SpeedSliderSheet(
+        initialSpeed: targetSpeed,
+        onSpeedSet: onSpeedSet,
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -579,25 +669,25 @@ class _SpeedControl extends StatelessWidget {
             icon: Icons.remove,
             onPressed: enabled && targetSpeed > kSpeedMin ? onDecrease : null,
           ),
-          Column(
-            children: [
-              Text(
-                '${targetSpeed.toStringAsFixed(1)} km/h',
-                style: TextStyle(
-                  fontSize: 30,
-                  fontWeight: FontWeight.w700,
-                  color: enabled ? KScanColors.ink : KScanColors.muted,
-                  letterSpacing: -0.5,
+          GestureDetector(
+            onTap: () => _openSlider(context),
+            child: Column(
+              children: [
+                Text(
+                  '${targetSpeed.toStringAsFixed(1)} km/h',
+                  style: TextStyle(
+                    fontSize: 30,
+                    fontWeight: FontWeight.w700,
+                    color: enabled ? KScanColors.ink : KScanColors.muted,
+                    letterSpacing: -0.5,
+                  ),
                 ),
-              ),
-              Text(
-                'velocidad objetivo',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: KScanColors.muted,
+                Text(
+                  enabled ? 'tocar para ajustar' : 'velocidad objetivo',
+                  style: const TextStyle(fontSize: 12, color: KScanColors.muted),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
           _SpeedButton(
             icon: Icons.add,
@@ -635,6 +725,248 @@ class _SpeedButton extends StatelessWidget {
       ),
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Modal de ajuste de velocidad con slider vertical
+// ---------------------------------------------------------------------------
+
+class _SpeedSliderSheet extends StatefulWidget {
+  final double initialSpeed;
+  final ValueChanged<double> onSpeedSet;
+
+  const _SpeedSliderSheet({
+    required this.initialSpeed,
+    required this.onSpeedSet,
+  });
+
+  @override
+  State<_SpeedSliderSheet> createState() => _SpeedSliderSheetState();
+}
+
+class _SpeedSliderSheetState extends State<_SpeedSliderSheet> {
+  late double _speed;
+  static const List<double> _presets = [1.0, 4.0, 6.0];
+
+  @override
+  void initState() {
+    super.initState();
+    _speed = widget.initialSpeed;
+  }
+
+  void _apply(double value) {
+    final rounded = (value * 10).round() / 10;
+    final clamped = rounded.clamp(kSpeedMin, kSpeedMax);
+    if (clamped == _speed) return;
+    setState(() => _speed = clamped);
+    widget.onSpeedSet(clamped);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 575,
+      decoration: const BoxDecoration(
+        color: KScanColors.surfaceDark,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+      child: Column(
+        children: [
+          // Handle
+          Center(
+            child: Container(
+              width: 36,
+              height: 4,
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+          ),
+          const SizedBox(height: 20),
+          // Velocidad actual
+          Text(
+            _speed.toStringAsFixed(1),
+            style: const TextStyle(
+              fontSize: 64,
+              fontWeight: FontWeight.w800,
+              color: KScanColors.accent,
+              letterSpacing: -2,
+              height: 1,
+            ),
+          ),
+          const Text(
+            'km/h',
+            style: TextStyle(fontSize: 16, color: KScanColors.muted, fontWeight: FontWeight.w500),
+          ),
+          const SizedBox(height: 20),
+          // Cinta métrica
+          Expanded(
+            child: _SpeedTape(speed: _speed, onChanged: _apply),
+          ),
+          const SizedBox(height: 20),
+          // Chips de velocidades sugeridas
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: _presets.map((preset) {
+              final isActive = (_speed - preset).abs() < 0.05;
+              return GestureDetector(
+                onTap: () => _apply(preset),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 150),
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: isActive ? KScanColors.accent : Colors.white.withOpacity(0.08),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: isActive ? KScanColors.accent : Colors.white.withOpacity(0.15),
+                    ),
+                  ),
+                  child: Text(
+                    '${preset.toStringAsFixed(0)} km/h',
+                    style: TextStyle(
+                      color: isActive ? KScanColors.ink : KScanColors.background,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 14,
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+          SafeArea(top: false, child: const SizedBox(height: 16)),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cinta métrica de velocidad
+// ---------------------------------------------------------------------------
+
+class _SpeedTape extends StatefulWidget {
+  final double speed;
+  final ValueChanged<double> onChanged;
+
+  const _SpeedTape({required this.speed, required this.onChanged});
+
+  @override
+  State<_SpeedTape> createState() => _SpeedTapeState();
+}
+
+class _SpeedTapeState extends State<_SpeedTape> {
+  double get _pxPerStep {
+    final box = context.findRenderObject() as RenderBox?;
+    final h = box?.size.height ?? 200;
+    final totalSteps = ((kSpeedMax - kSpeedMin) / 0.1).round();
+    return h / totalSteps;
+  }
+
+  void _onDragUpdate(DragUpdateDetails d) {
+    // dy negativo = dedo sube = indicador sube = velocidad mayor (top = max)
+    final delta = (-d.delta.dy / _pxPerStep) * 0.1;
+    final raw = widget.speed + delta;
+    final rounded = (raw * 10).round() / 10;
+    final clamped = rounded.clamp(kSpeedMin, kSpeedMax).toDouble();
+    if (clamped != widget.speed) widget.onChanged(clamped);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onVerticalDragUpdate: _onDragUpdate,
+      child: CustomPaint(
+        painter: _TapePainter(speed: widget.speed),
+        child: const SizedBox.expand(),
+      ),
+    );
+  }
+}
+
+class _TapePainter extends CustomPainter {
+  final double speed;
+
+  const _TapePainter({required this.speed});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final totalRange = kSpeedMax - kSpeedMin; // 5.0
+    final totalSteps = (totalRange / 0.1).round(); // 50
+    final stepHeight = size.height / totalSteps; // px por cada 0.1 km/h
+
+    // Y=0 = kSpeedMax (top), Y=height = kSpeedMin (bottom)
+    for (int i = 0; i <= totalSteps; i++) {
+      final stepSpeed = (kSpeedMax * 10 - i).round() / 10.0;
+      final y = i * stepHeight;
+
+      final isMajor = (stepSpeed * 10).round() % 10 == 0;
+      final isMid   = (stepSpeed * 10).round() % 5  == 0;
+
+      final tickLen = isMajor ? 48.0 : isMid ? 30.0 : 16.0;
+      final strokeW = isMajor ? 2.0  : isMid ? 1.5  : 1.0;
+      final opacity = isMajor ? 0.85 : isMid ? 0.50 : 0.22;
+
+      canvas.drawLine(
+        Offset(size.width - tickLen, y),
+        Offset(size.width - 6, y),
+        Paint()
+          ..color = Colors.white.withOpacity(opacity)
+          ..strokeWidth = strokeW
+          ..strokeCap = StrokeCap.round,
+      );
+
+      if (isMajor) {
+        final tp = TextPainter(
+          text: TextSpan(
+            text: stepSpeed.toStringAsFixed(1),
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.75),
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        tp.paint(canvas, Offset(12, y - tp.height / 2));
+      }
+    }
+
+    // Indicador dorado — se mueve con la velocidad actual
+    final indicatorY = (kSpeedMax - speed) / totalRange * size.height;
+
+    // Sombra suave detrás de la línea
+    canvas.drawLine(
+      Offset(0, indicatorY),
+      Offset(size.width, indicatorY),
+      Paint()
+        ..color = KScanColors.accent.withOpacity(0.25)
+        ..strokeWidth = 10,
+    );
+
+    // Línea dorada
+    canvas.drawLine(
+      Offset(0, indicatorY),
+      Offset(size.width, indicatorY),
+      Paint()
+        ..color = KScanColors.accent
+        ..strokeWidth = 2.5
+        ..strokeCap = StrokeCap.round,
+    );
+
+    // Triángulo lateral
+    final tri = Path()
+      ..moveTo(0, indicatorY - 10)
+      ..lineTo(18, indicatorY)
+      ..lineTo(0, indicatorY + 10)
+      ..close();
+    canvas.drawPath(tri, Paint()..color = KScanColors.accent);
+  }
+
+  @override
+  bool shouldRepaint(_TapePainter old) => old.speed != speed;
 }
 
 class _ControlButtons extends StatelessWidget {
@@ -861,6 +1193,62 @@ class _DayStat extends StatelessWidget {
           style: const TextStyle(fontSize: 11, color: KScanColors.muted),
         ),
       ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Indicador de página para el PageView de telemetría
+// ---------------------------------------------------------------------------
+
+class _PageIndicator extends StatefulWidget {
+  final PageController controller;
+  final int count;
+
+  const _PageIndicator({required this.controller, required this.count});
+
+  @override
+  State<_PageIndicator> createState() => _PageIndicatorState();
+}
+
+class _PageIndicatorState extends State<_PageIndicator> {
+  int _current = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_onPage);
+  }
+
+  void _onPage() {
+    final page = widget.controller.page?.round() ?? 0;
+    if (page != _current && mounted) setState(() => _current = page);
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_onPage);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.count <= 1) return const SizedBox.shrink();
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: List.generate(widget.count, (i) {
+        final active = i == _current;
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          margin: const EdgeInsets.symmetric(horizontal: 3),
+          width: active ? 16 : 6,
+          height: 6,
+          decoration: BoxDecoration(
+            color: active ? KScanColors.accent : KScanColors.muted,
+            borderRadius: BorderRadius.circular(3),
+          ),
+        );
+      }),
     );
   }
 }

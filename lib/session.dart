@@ -1,6 +1,28 @@
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 
+// ---------------------------------------------------------------------------
+// SpeedSample — muestra de velocidad en el tiempo
+// t: segundos desde inicio de sesión
+// v: velocidad en km/h
+// ---------------------------------------------------------------------------
+class SpeedSample {
+  final int t;
+  final double v;
+
+  const SpeedSample({required this.t, required this.v});
+
+  Map<String, dynamic> toJson() => {'t': t, 'v': v};
+
+  factory SpeedSample.fromJson(Map<String, dynamic> json) => SpeedSample(
+        t: json['t'] as int,
+        v: (json['v'] as num).toDouble(),
+      );
+}
+
+// ---------------------------------------------------------------------------
+// WorkoutSession
+// ---------------------------------------------------------------------------
 class WorkoutSession {
   final String id;
   final DateTime startedAt;
@@ -8,6 +30,7 @@ class WorkoutSession {
   final int distanceMeters;
   final int calories;
   final int durationSeconds;
+  final List<SpeedSample> samples;
 
   const WorkoutSession({
     required this.id,
@@ -16,12 +39,25 @@ class WorkoutSession {
     required this.distanceMeters,
     required this.calories,
     required this.durationSeconds,
+    this.samples = const [],
   });
 
   String get durationFormatted {
     final m = durationSeconds ~/ 60;
     final s = durationSeconds % 60;
     return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+  }
+
+  double get avgSpeedKmh {
+    if (samples.isEmpty) return 0;
+    final moving = samples.where((s) => s.v > 0).toList();
+    if (moving.isEmpty) return 0;
+    return moving.map((s) => s.v).reduce((a, b) => a + b) / moving.length;
+  }
+
+  double get maxSpeedKmh {
+    if (samples.isEmpty) return 0;
+    return samples.map((s) => s.v).reduce((a, b) => a > b ? a : b);
   }
 
   Map<String, dynamic> toJson() => {
@@ -31,6 +67,7 @@ class WorkoutSession {
         'distanceMeters': distanceMeters,
         'calories': calories,
         'durationSeconds': durationSeconds,
+        'samples': samples.map((s) => s.toJson()).toList(),
       };
 
   factory WorkoutSession.fromJson(Map<String, dynamic> json) => WorkoutSession(
@@ -40,9 +77,17 @@ class WorkoutSession {
         distanceMeters: json['distanceMeters'] as int,
         calories: json['calories'] as int,
         durationSeconds: json['durationSeconds'] as int,
+        samples: json['samples'] != null
+            ? (json['samples'] as List<dynamic>)
+                .map((e) => SpeedSample.fromJson(e as Map<String, dynamic>))
+                .toList()
+            : const [],
       );
 }
 
+// ---------------------------------------------------------------------------
+// SessionRepository
+// ---------------------------------------------------------------------------
 class SessionRepository {
   static const _key = 'workout_sessions';
   final SharedPreferences _prefs;

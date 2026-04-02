@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'app_theme.dart';
 import 'session.dart';
+import 'speed_chart_card.dart';
 
 class HistoryScreen extends StatefulWidget {
   final SessionRepository? repo;
@@ -164,11 +165,23 @@ class _SessionTile extends StatelessWidget {
     return '${fmt(session.startedAt)} – ${fmt(session.endedAt)}';
   }
 
+  void _openDetail(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _SessionDetailSheet(session: session),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Card(
       margin: const EdgeInsets.only(bottom: 8),
-      child: Padding(
+      child: InkWell(
+        onTap: session.samples.isNotEmpty ? () => _openDetail(context) : null,
+        borderRadius: BorderRadius.circular(16),
+        child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         child: Row(
           children: [
@@ -209,6 +222,8 @@ class _SessionTile extends StatelessWidget {
                 ],
               ),
             ),
+            if (session.samples.isNotEmpty)
+              const Icon(Icons.bar_chart, size: 18, color: KScanColors.accent),
             PopupMenuButton<String>(
               icon: const Icon(Icons.more_vert, size: 20, color: Colors.grey),
               onSelected: (value) {
@@ -229,6 +244,79 @@ class _SessionTile extends StatelessWidget {
             ),
           ],
         ),
+      ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bottom sheet con telemetría completa de la sesión
+// ---------------------------------------------------------------------------
+class _SessionDetailSheet extends StatelessWidget {
+  final WorkoutSession session;
+
+  const _SessionDetailSheet({required this.session});
+
+  String _timeRange() {
+    String fmt(DateTime dt) =>
+        '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+    return '${fmt(session.startedAt)} – ${fmt(session.endedAt)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: MediaQuery.of(context).size.height * 0.75,
+      decoration: const BoxDecoration(
+        color: KScanColors.background,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Handle
+          Center(
+            child: Container(
+              width: 36,
+              height: 4,
+              decoration: BoxDecoration(
+                color: KScanColors.divider,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          // Encabezado
+          Text(
+            _timeRange(),
+            style: const TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.w700,
+              color: KScanColors.ink,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '${session.distanceMeters} m  ·  ${session.durationFormatted}  ·  ${session.calories} kcal',
+            style: const TextStyle(fontSize: 13, color: KScanColors.muted),
+          ),
+          const SizedBox(height: 16),
+          // Gráfica
+          Expanded(
+            child: SpeedChartCard(
+              samples: session.samples,
+              elapsedSeconds: session.durationSeconds,
+              distanceMeters: session.distanceMeters,
+              calories: session.calories,
+            ),
+          ),
+          SafeArea(
+            top: false,
+            child: const SizedBox(height: 8),
+          ),
+        ],
       ),
     );
   }
