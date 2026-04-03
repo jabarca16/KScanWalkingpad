@@ -6,6 +6,7 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'app_theme.dart';
 import 'history_screen.dart';
 import 'session.dart';
+import 'pomodoro_walk_card.dart';
 import 'speed_chart_card.dart';
 import 'track_screen.dart';
 import 'treadmill_data.dart';
@@ -111,6 +112,7 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
 
   // PageView controller
   final _pageController = PageController();
+  bool _pomodoroActive = false;
 
   @override
   void initState() {
@@ -474,9 +476,11 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
           ],
         ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-        child: Column(
+      body: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+          child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             // Estado de conexión
@@ -489,69 +493,73 @@ class _TreadmillScreenState extends State<TreadmillScreen> {
               const SizedBox(height: 8),
             ],
 
-            // Telemetría — PageView swipeable
-            if (_connected) ...[
-              Expanded(
+            // Telemetría — PageView swipeable (siempre visible)
+            Expanded(
+              child: Column(
+                children: [
+                  Expanded(
+                    child: PageView(
+                      controller: _pageController,
+                      physics: _treadmillState != TreadmillState.idle || _pomodoroActive
+                          ? const NeverScrollableScrollPhysics()
+                          : const PageScrollPhysics(),
+                      children: [
+                        SpeedChartCard(
+                          samples: _sessionSamples,
+                          currentSpeed: _data?.speedKmh,
+                          elapsedSeconds: _data != null ? _sessionSeconds : null,
+                          distanceMeters: _data != null ? _sessionDistance : null,
+                          calories: _data != null ? _sessionCalories : null,
+                          steps: _data != null ? _sessionSteps : null,
+                        ),
+                        PomodoroWalkCard(
+                          onTreadmillStart: _start,
+                          onTreadmillStop: _stop,
+                          onSetSpeed: _setSpeed,
+                          onActiveChanged: (active) =>
+                              setState(() => _pomodoroActive = active),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  _PageIndicator(
+                    controller: _pageController,
+                    count: 2,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 10),
+
+            // Panel de control (siempre visible, deshabilitado sin conexión)
+            if (!_pomodoroActive) ...[
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
                 child: Column(
                   children: [
-                    Expanded(
-                      child: PageView(
-                        controller: _pageController,
-                        children: [
-                          SpeedChartCard(
-                            samples: _sessionSamples,
-                            currentSpeed: _data?.speedKmh,
-                            elapsedSeconds: _data != null ? _sessionSeconds : null,
-                            distanceMeters: _data != null ? _sessionDistance : null,
-                            calories: _data != null ? _sessionCalories : null,
-                            steps: _data != null ? _sessionSteps : null,
-                          ),
-                          // Próximas páginas irán aquí
-                        ],
-                      ),
+                    _SpeedControl(
+                      targetSpeed: _targetSpeed,
+                      enabled: _treadmillState == TreadmillState.running,
+                      onIncrease: _increaseSpeed,
+                      onDecrease: _decreaseSpeed,
+                      onSpeedSet: _setSpeed,
                     ),
                     const SizedBox(height: 10),
-                    _PageIndicator(
-                      controller: _pageController,
-                      count: 1,
+                    _ControlButtons(
+                      state: _treadmillState,
+                      connected: _connected,
+                      onStart: _start,
+                      onPause: _pause,
+                      onResume: _start,
+                      onStop: _stop,
                     ),
                   ],
                 ),
               ),
-              const SizedBox(height: 10),
-            ] else ...[
-              const Spacer(),
-            ],
-
-            // Panel de control (solo cuando conectado)
-            if (_connected) ...[
-              SafeArea(
-                top: false,
-                child: Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
-                  child: Column(
-                    children: [
-                      _SpeedControl(
-                        targetSpeed: _targetSpeed,
-                        enabled: _treadmillState == TreadmillState.running,
-                        onIncrease: _increaseSpeed,
-                        onDecrease: _decreaseSpeed,
-                        onSpeedSet: _setSpeed,
-                      ),
-                      const SizedBox(height: 10),
-                      _ControlButtons(
-                        state: _treadmillState,
-                        onStart: _start,
-                        onPause: _pause,
-                        onResume: _start,
-                        onStop: _stop,
-                      ),
-                    ],
-                  ),
-                ),
-              ),
             ],
           ],
+          ),
         ),
       ),
       floatingActionButton: _connected
@@ -971,6 +979,7 @@ class _TapePainter extends CustomPainter {
 
 class _ControlButtons extends StatelessWidget {
   final TreadmillState state;
+  final bool connected;
   final VoidCallback onStart;
   final VoidCallback onPause;
   final VoidCallback onResume;
@@ -978,6 +987,7 @@ class _ControlButtons extends StatelessWidget {
 
   const _ControlButtons({
     required this.state,
+    required this.connected,
     required this.onStart,
     required this.onPause,
     required this.onResume,
@@ -988,7 +998,7 @@ class _ControlButtons extends StatelessWidget {
   Widget build(BuildContext context) {
     return switch (state) {
       TreadmillState.idle => FilledButton.icon(
-          onPressed: onStart,
+          onPressed: connected ? onStart : null,
           icon: const Icon(Icons.play_arrow),
           label: const Text('Iniciar'),
           // Hereda el estilo golden del tema
